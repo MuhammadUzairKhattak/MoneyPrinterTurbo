@@ -576,3 +576,56 @@ Trying to load the model directly from the local cache, if it exists.
 ## 许可证 📝
 
 点击查看 [`LICENSE`](LICENSE) 文件
+
+## Fork maintenance
+
+This fork keeps the original project as `upstream` and the personal fork as
+`origin`.
+
+```shell
+git remote -v
+```
+
+Expected remotes:
+
+```text
+origin   https://github.com/MuhammadUzairKhattak/MoneyPrinterTurbo.git
+upstream https://github.com/harry0703/MoneyPrinterTurbo.git
+```
+
+To push local work to the fork:
+
+```shell
+git status
+git add <files>
+git commit -m "Describe the change"
+git push origin main
+```
+
+Do not commit `config.toml`; it can contain API keys.
+
+To pull new changes from the original project into the fork:
+
+```shell
+git fetch upstream
+git switch main
+git merge upstream/main
+git push origin main
+```
+
+If you prefer a linear history, replace the merge step with:
+
+```shell
+git rebase upstream/main
+git push origin main
+```
+
+When working on a new feature, first update `main`, then create a branch:
+
+```shell
+git fetch upstream
+git switch main
+git merge upstream/main
+git push origin main
+git switch -c my-feature-branch
+```

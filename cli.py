@@ -49,6 +49,14 @@ _CLI_VIDEO_SOURCES = (
     "openai_image",
     "local",
 )
+_RECAP_VIDEO_PROVIDERS = (
+    "wavespeed",
+    "volcengine_seedance",
+    "ofox",
+    "metaso_minimax",
+    "muapi",
+    "openai_image",
+)
 
 
 class _CliHelpFormatter(
@@ -337,6 +345,65 @@ Batch manifests:
         "--custom-system-prompt",
         default=None,
         help="replace the default LLM system prompt for script generation",
+    )
+
+    recap_group = parser.add_argument_group("TV recap")
+    recap_group.add_argument(
+        "--recap",
+        action="store_true",
+        help="run the TV recap pipeline instead of the generic script-to-video pipeline",
+    )
+    recap_group.add_argument(
+        "--show",
+        default="",
+        help="show name for --recap; used for storage/shows/<show>",
+    )
+    recap_group.add_argument(
+        "--season",
+        type=_positive_int,
+        default=1,
+        help="season number for --recap",
+    )
+    recap_group.add_argument(
+        "--episode",
+        type=_positive_int,
+        default=1,
+        help="episode number for --recap",
+    )
+    recap_group.add_argument(
+        "--episode-title",
+        default="",
+        help="optional episode title for --recap",
+    )
+    recap_group.add_argument(
+        "--episode-summary-file",
+        default="",
+        metavar="PATH",
+        help="UTF-8 text file containing the episode summary or transcript for --recap",
+    )
+    recap_group.add_argument(
+        "--recap-provider",
+        default="volcengine_seedance",
+        choices=_RECAP_VIDEO_PROVIDERS,
+        help="existing MPT provider used to generate individual recap shots",
+    )
+    recap_group.add_argument(
+        "--recap-target-duration",
+        type=_positive_int,
+        default=60,
+        help="target recap duration in seconds",
+    )
+    recap_group.add_argument(
+        "--recap-min-shots",
+        type=_positive_int,
+        default=8,
+        help="minimum shots requested from the episode analyzer",
+    )
+    recap_group.add_argument(
+        "--recap-max-shots",
+        type=_positive_int,
+        default=15,
+        help="maximum shots requested from the episode analyzer",
     )
 
     material_group = parser.add_argument_group("materials and pipeline")
@@ -702,10 +769,35 @@ Batch manifests:
 
     if (
         not args.batch_file
+        and not args.recap
         and not args.video_subject.strip()
         and not args.video_script.strip()
     ):
         parser.error("one of --video-subject or --video-script is required")
+
+    if args.recap:
+        if args.batch_file:
+            parser.error("--recap cannot be combined with --batch-file")
+        if not args.show.strip():
+            parser.error("--show is required with --recap")
+        if not args.episode_summary_file.strip():
+            parser.error("--episode-summary-file is required with --recap")
+        if args.recap_min_shots > args.recap_max_shots:
+            parser.error("--recap-min-shots must be <= --recap-max-shots")
+        if args.video_materials.strip():
+            parser.error("--video-materials is not used with --recap")
+        if args.stop_at != "video":
+            parser.error("--recap currently supports only --stop-at video")
+        if args.recap_provider == "wavespeed" and not args.confirm_wavespeed_charge:
+            parser.error("--confirm-wavespeed-charge is required with --recap-provider wavespeed")
+        if args.recap_provider == "volcengine_seedance" and not args.confirm_seedance_charge:
+            parser.error("--confirm-seedance-charge is required with --recap-provider volcengine_seedance")
+        if args.recap_provider == "ofox" and not args.confirm_ofox_charge:
+            parser.error("--confirm-ofox-charge is required with --recap-provider ofox")
+        if args.recap_provider == "metaso_minimax" and not args.confirm_metaso_minimax_charge:
+            parser.error("--confirm-metaso-minimax-charge is required with --recap-provider metaso_minimax")
+        if args.recap_provider == "muapi" and not args.confirm_muapi_charge:
+            parser.error("--confirm-muapi-charge is required with --recap-provider muapi")
 
     if not args.batch_file and args.video_source == "local" and args.stop_at == "terms":
         parser.error(
@@ -1714,8 +1806,84 @@ def _run_batch_tasks(args: argparse.Namespace, tasks: list[VideoParams]) -> int:
     return 1 if failed_count else 0
 
 
+def _run_recap_cli(args: argparse.Namespace) -> int:
+    try:
+        params = build_video_params(args)
+        prepare_cli_files(params, stop_at=args.stop_at)
+        summary_path = _resolve_cli_file(
+            args.episode_summary_file,
+            description="episode summary",
+        )
+        with open(summary_path, "r", encoding="utf-8") as file:
+            episode_summary = file.read().strip()
+        if not episode_summary:
+            raise ValueError("episode summary file is empty")
+    except (ValueError, OSError) as exc:
+        logger.error(f"invalid recap CLI input: {exc}")
+        return 2
+
+    from app.tv_recap.models import EpisodeInput
+    from app.tv_recap.pipeline import run_recap_pipeline
+    from app.utils import utils
+
+    task_id = args.task_id or utils.get_uuid()
+    episode = EpisodeInput(
+        show_name=args.show.strip(),
+        season=args.season,
+        episode=args.episode,
+        title=args.episode_title.strip(),
+        summary=episode_summary,
+        language=params.video_language or "en",
+    )
+
+    logger.info(
+        f"start TV recap CLI task: task_id={task_id}, "
+        f"episode={episode.show_name} {episode.episode_id}, "
+        f"provider={args.recap_provider}"
+    )
+    try:
+        result = run_recap_pipeline(
+            task_id=task_id,
+            episode=episode,
+            base_video_params=params,
+            shot_provider=args.recap_provider,
+            video_aspect=params.video_aspect,
+            target_duration=args.recap_target_duration,
+            min_shots=args.recap_min_shots,
+            max_shots=args.recap_max_shots,
+            stop_at=args.stop_at,
+        )
+    except Exception as exc:
+        logger.exception(
+            f"TV recap CLI task failed: task_id={task_id}, error={exc}"
+        )
+        return 1
+
+    assembly_result = result.get("assembly_result")
+    try:
+        from app.services import task as tm
+
+        failed = (
+            not isinstance(assembly_result, dict)
+            or assembly_result.get("state") == tm.const.TASK_STATE_FAILED
+        )
+    except Exception:
+        failed = not isinstance(assembly_result, dict)
+    if failed:
+        logger.error(
+            f"TV recap assembly failed: task_id={task_id}, "
+            f"result={assembly_result}"
+        )
+        return 1
+
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def run_cli(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.recap:
+        return _run_recap_cli(args)
     if args.batch_file:
         try:
             tasks = _build_batch_tasks(args)
